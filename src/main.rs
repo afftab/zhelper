@@ -1,7 +1,10 @@
 mod app;
+mod audio;
 mod battery;
 mod config;
+mod cpu;
 mod gpu;
+mod sysutil;
 mod system;
 
 fn main() {

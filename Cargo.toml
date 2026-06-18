@@ -1,8 +1,8 @@
 [package]
-name = "ghelper-linux"
-version = "0.1.1"
+name = "zhelper"
+version = "0.2.0"
 edition = "2021"
-description = "GHelper Linux — ASUS ROG laptop battery & system TUI for Pop!_OS / Ubuntu"
+description = "ZHelper — ASUS ROG laptop battery, CPU & GPU TUI for Linux"
 license = "MIT"
 repository = "https://github.com/Ichihiroy/ghelper-for-linux"
 homepage = "https://github.com/Ichihiroy/ghelper-for-linux"
@@ -12,7 +12,7 @@ categories = ["command-line-utilities"]
 exclude = [".github/*", "target/*"]
 
 [[bin]]
-name = "ghelper-linux"
+name = "zhelper"
 path = "src/main.rs"
 
 [dependencies]

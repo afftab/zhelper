@@ -1,4 +1,4 @@
-// ── GHelper Linux — TUI
+// ── ZHelper — TUI
 // Layout inspired by spotify-tui: sidebar + content + status bar.
 // Single phosphor-green accent, near-black ground, minimal chrome.
 
@@ -21,9 +21,11 @@ use ratatui::{
 };
 
 use crate::{
+    audio::AudioManager,
     battery::{BatteryManager, ChargeStatus},
     config::Config,
-    gpu::{GpuManager, GpuMode, PowerProfile},
+    cpu::{CpuManager, PptKind, ThermalProfile},
+    gpu::{GpuManager, GpuMode},
     system::SystemInfo,
 };
 
@@ -57,7 +59,9 @@ pub struct TuiApp {
     pub system:           SystemInfo,
     pub config:           Config,
     pub gpu:              GpuManager,
-    pub active_tab:       usize,   // 0 battery  1 system  2 gpu  3 settings
+    pub cpu:              CpuManager,
+    pub audio:            AudioManager,
+    pub active_tab:       usize,   // 0 battery  1 system  2 cpu  3 gpu  4 audio  5 settings
     pub focus:            Focus,
     pub desired_limit:    u8,
     pub status:           Status,
@@ -65,8 +69,7 @@ pub struct TuiApp {
     pub last_refresh:     Instant,
     pub should_quit:      bool,
     pub settings_cursor:  usize,
-    pub gpu_section:      usize,  // 0 = gpu mode  1 = power profile
-    pub gpu_last_section: usize,  // which section triggered the last status
+    pub cpu_section:      usize,  // which row in cpu tab is focused
 }
 
 impl TuiApp {
@@ -79,6 +82,8 @@ impl TuiApp {
             battery,
             system: SystemInfo::new(),
             gpu: GpuManager::new(),
+            cpu: CpuManager::new(),
+            audio: AudioManager::new(),
             config,
             active_tab: 0,
             focus: Focus::Sidebar,
@@ -87,8 +92,7 @@ impl TuiApp {
             last_refresh: Instant::now(),
             should_quit: false,
             settings_cursor: 0,
-            gpu_section: 0,
-            gpu_last_section: 0,
+            cpu_section: 0,
         };
         if app.config.auto_apply_on_start {
             let _ = app.battery.set_charge_limit(app.desired_limit);
@@ -100,6 +104,8 @@ impl TuiApp {
         self.battery.refresh();
         self.system.refresh();
         self.gpu.refresh();
+        self.cpu.refresh();
+        self.audio.refresh();
         self.last_refresh = Instant::now();
     }
 
@@ -154,18 +160,8 @@ impl TuiApp {
     }
 
     fn do_apply_gpu(&mut self) {
-        self.gpu_last_section = 0;
         match self.gpu.apply_gpu_mode() {
-            Ok(()) => self.ok("mode set — reboot to apply", 10),
-            Err(e) => self.err(e, 8),
-        }
-    }
-
-    fn do_apply_profile(&mut self) {
-        self.gpu_last_section = 1;
-        let label = self.gpu.pending_profile.label();
-        match self.gpu.apply_power_profile() {
-            Ok(()) => self.ok(format!("{label} profile active"), 4),
+            Ok(()) => self.ok(format!("{} mode active", self.gpu.pending_mode.label()), 4),
             Err(e) => self.err(e, 8),
         }
     }
@@ -178,8 +174,13 @@ impl TuiApp {
             KeyCode::Char('q') | KeyCode::Char('Q') => { self.should_quit = true; return; }
             KeyCode::Char('r') | KeyCode::Char('R') => { self.refresh(); return; }
             KeyCode::Tab => {
-                self.focus = if self.focus == Focus::Sidebar { Focus::Content } else { Focus::Sidebar };
-                return;
+                // In audio tab, Tab switches between speakers/mics
+                if self.active_tab == 4 && self.focus == Focus::Content {
+                    // fall through to content_key
+                } else {
+                    self.focus = if self.focus == Focus::Sidebar { Focus::Content } else { Focus::Sidebar };
+                    return;
+                }
             }
             _ => {}
         }
@@ -191,7 +192,7 @@ impl TuiApp {
 
     fn sidebar_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Down  | KeyCode::Char('j') => self.active_tab = (self.active_tab + 1).min(3),
+            KeyCode::Down  | KeyCode::Char('j') => self.active_tab = (self.active_tab + 1).min(5),
             KeyCode::Up    | KeyCode::Char('k') => { if self.active_tab > 0 { self.active_tab -= 1; } }
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.focus = Focus::Content,
             _ => {}
@@ -206,8 +207,10 @@ impl TuiApp {
         match self.active_tab {
             0 => self.battery_key(code, mods),
             1 => {} // system tab — read-only
-            2 => self.gpu_key(code),
-            3 => self.settings_key(code),
+            2 => self.cpu_key(code),
+            3 => self.gpu_key(code),
+            4 => self.audio_key(code),
+            5 => self.settings_key(code),
             _ => {}
         }
     }
@@ -230,39 +233,216 @@ impl TuiApp {
 
     fn gpu_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Down  | KeyCode::Char('j') => { if self.gpu_section < 1 { self.gpu_section += 1; } }
-            KeyCode::Up    | KeyCode::Char('k') => { if self.gpu_section > 0 { self.gpu_section -= 1; } }
-            KeyCode::Left => match self.gpu_section {
-                0 => {
-                    let variants = GpuMode::variants();
-                    let idx = self.gpu.pending_mode.index().saturating_sub(1);
-                    self.gpu.pending_mode = variants[idx];
+            KeyCode::Left => {
+                let variants = GpuMode::variants();
+                let idx = self.gpu.pending_mode.index().saturating_sub(1);
+                self.gpu.pending_mode = variants[idx];
+            }
+            KeyCode::Right => {
+                let variants = GpuMode::variants();
+                let idx = (self.gpu.pending_mode.index() + 1).min(variants.len() - 1);
+                self.gpu.pending_mode = variants[idx];
+            }
+            KeyCode::Enter | KeyCode::Char('a') => self.do_apply_gpu(),
+            _ => {}
+        }
+    }
+
+    // ── CPU tab ──────────────────────────────────────────────────────────────
+
+    fn cpu_key(&mut self, code: KeyCode) {
+        // Sections:
+        // 0 = thermal profile, 1 = governor, 2 = EPP, 3 = boost
+        // 4-9 = PPT limits (apu, fppt, pl1, pl2, nv_boost, nv_temp)
+        let max_section = if self.cpu.asus_wmi_available { 9 } else { 3 };
+        match code {
+            KeyCode::Down  | KeyCode::Char('j') => { if self.cpu_section < max_section { self.cpu_section += 1; } }
+            KeyCode::Up    | KeyCode::Char('k') => { if self.cpu_section > 0 { self.cpu_section -= 1; } }
+            KeyCode::Left => self.cpu_left(),
+            KeyCode::Right => self.cpu_right(),
+            KeyCode::Enter | KeyCode::Char('a') => self.cpu_apply(),
+            KeyCode::Char(' ') => {
+                if self.cpu_section == 3 {
+                    self.cpu.pending_boost = !self.cpu.pending_boost;
+                    self.cpu_apply();
                 }
-                1 => {
-                    let variants = PowerProfile::variants();
-                    let idx = self.gpu.pending_profile.index().saturating_sub(1);
-                    self.gpu.pending_profile = variants[idx];
+            }
+            _ => {}
+        }
+    }
+
+    fn cpu_left(&mut self) {
+        match self.cpu_section {
+            0 => {
+                let variants = ThermalProfile::variants();
+                let idx = self.cpu.pending_thermal.index().saturating_sub(1);
+                self.cpu.pending_thermal = variants[idx];
+            }
+            1 => {
+                if !self.cpu.governor.available.is_empty() {
+                    let idx = self.cpu.governor.available.iter().position(|g| g == &self.cpu.pending_governor).unwrap_or(0);
+                    let new_idx = idx.saturating_sub(1);
+                    self.cpu.pending_governor = self.cpu.governor.available[new_idx].clone();
                 }
-                _ => {}
-            },
-            KeyCode::Right => match self.gpu_section {
-                0 => {
-                    let variants = GpuMode::variants();
-                    let idx = (self.gpu.pending_mode.index() + 1).min(variants.len() - 1);
-                    self.gpu.pending_mode = variants[idx];
+            }
+            2 => {
+                if !self.cpu.epp.available.is_empty() {
+                    let idx = self.cpu.epp.available.iter().position(|e| e == &self.cpu.pending_epp).unwrap_or(0);
+                    let new_idx = idx.saturating_sub(1);
+                    self.cpu.pending_epp = self.cpu.epp.available[new_idx].clone();
                 }
-                1 => {
-                    let variants = PowerProfile::variants();
-                    let idx = (self.gpu.pending_profile.index() + 1).min(variants.len() - 1);
-                    self.gpu.pending_profile = variants[idx];
+            }
+            3 => {
+                self.cpu.pending_boost = false;
+            }
+            4 => { if let Some(v) = self.cpu.pending_apu_sppt { self.cpu.pending_apu_sppt = Some(v.saturating_sub(1)); } }
+            5 => { if let Some(v) = self.cpu.pending_fppt { self.cpu.pending_fppt = Some(v.saturating_sub(1)); } }
+            6 => { if let Some(v) = self.cpu.pending_pl1_spl { self.cpu.pending_pl1_spl = Some(v.saturating_sub(1)); } }
+            7 => { if let Some(v) = self.cpu.pending_pl2_sppt { self.cpu.pending_pl2_sppt = Some(v.saturating_sub(1)); } }
+            8 => { if let Some(v) = self.cpu.pending_nv_boost { self.cpu.pending_nv_boost = Some(v.saturating_sub(1)); } }
+            9 => { if let Some(v) = self.cpu.pending_nv_temp_target { self.cpu.pending_nv_temp_target = Some(v.saturating_sub(1)); } }
+            _ => {}
+        }
+    }
+
+    fn cpu_right(&mut self) {
+        match self.cpu_section {
+            0 => {
+                let variants = ThermalProfile::variants();
+                let idx = (self.cpu.pending_thermal.index() + 1).min(variants.len() - 1);
+                self.cpu.pending_thermal = variants[idx];
+            }
+            1 => {
+                if !self.cpu.governor.available.is_empty() {
+                    let idx = self.cpu.governor.available.iter().position(|g| g == &self.cpu.pending_governor).unwrap_or(0);
+                    let new_idx = (idx + 1).min(self.cpu.governor.available.len() - 1);
+                    self.cpu.pending_governor = self.cpu.governor.available[new_idx].clone();
                 }
-                _ => {}
-            },
-            KeyCode::Enter | KeyCode::Char('a') => match self.gpu_section {
-                0 => self.do_apply_gpu(),
-                1 => self.do_apply_profile(),
-                _ => {}
-            },
+            }
+            2 => {
+                if !self.cpu.epp.available.is_empty() {
+                    let idx = self.cpu.epp.available.iter().position(|e| e == &self.cpu.pending_epp).unwrap_or(0);
+                    let new_idx = (idx + 1).min(self.cpu.epp.available.len() - 1);
+                    self.cpu.pending_epp = self.cpu.epp.available[new_idx].clone();
+                }
+            }
+            3 => {
+                self.cpu.pending_boost = true;
+            }
+            4 => { self.cpu.pending_apu_sppt = self.cpu.pending_apu_sppt.map(|v| (v + 1).min(150)); }
+            5 => { self.cpu.pending_fppt = self.cpu.pending_fppt.map(|v| (v + 1).min(150)); }
+            6 => { self.cpu.pending_pl1_spl = self.cpu.pending_pl1_spl.map(|v| (v + 1).min(150)); }
+            7 => { self.cpu.pending_pl2_sppt = self.cpu.pending_pl2_sppt.map(|v| (v + 1).min(150)); }
+            8 => { self.cpu.pending_nv_boost = self.cpu.pending_nv_boost.map(|v| (v + 1).min(150)); }
+            9 => { self.cpu.pending_nv_temp_target = self.cpu.pending_nv_temp_target.map(|v| (v + 1).min(100)); }
+            _ => {}
+        }
+    }
+
+    fn cpu_apply(&mut self) {
+        let result = match self.cpu_section {
+            0 => {
+                let label = self.cpu.pending_thermal.label().to_string();
+                self.cpu.apply_thermal_profile().map(|()| format!("{label} thermal profile active"))
+            }
+            1 => {
+                let label = self.cpu.pending_governor.clone();
+                self.cpu.apply_governor().map(|()| format!("governor: {label}"))
+            }
+            2 => {
+                let label = self.cpu.pending_epp.clone();
+                self.cpu.apply_epp().map(|()| format!("EPP: {label}"))
+            }
+            3 => {
+                let on = self.cpu.pending_boost;
+                self.cpu.apply_boost().map(|()| format!("CPU boost {}", if on { "enabled" } else { "disabled" }))
+            }
+            4 => {
+                let label = PptKind::ApuSppt.label().to_string();
+                self.cpu.apply_ppt(PptKind::ApuSppt).map(|()| format!("{label} updated"))
+            }
+            5 => {
+                let label = PptKind::Fppt.label().to_string();
+                self.cpu.apply_ppt(PptKind::Fppt).map(|()| format!("{label} updated"))
+            }
+            6 => {
+                let label = PptKind::Pl1Spl.label().to_string();
+                self.cpu.apply_ppt(PptKind::Pl1Spl).map(|()| format!("{label} updated"))
+            }
+            7 => {
+                let label = PptKind::Pl2Sppt.label().to_string();
+                self.cpu.apply_ppt(PptKind::Pl2Sppt).map(|()| format!("{label} updated"))
+            }
+            8 => {
+                let label = PptKind::NvBoost.label().to_string();
+                self.cpu.apply_ppt(PptKind::NvBoost).map(|()| format!("{label} updated"))
+            }
+            9 => {
+                let label = PptKind::NvTempTarget.label().to_string();
+                self.cpu.apply_ppt(PptKind::NvTempTarget).map(|()| format!("{label} updated"))
+            }
+            _ => Ok(String::new()),
+        };
+        match result {
+            Ok(msg) => self.ok(msg, 4),
+            Err(e) => self.err(e, 8),
+        }
+    }
+
+    fn audio_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Tab => {
+                self.audio.section = if self.audio.section == 0 { 1 } else { 0 };
+                self.audio.cursor = 0;
+            }
+            KeyCode::Down  | KeyCode::Char('j') => {
+                let total = self.audio.total_rows();
+                if total > 0 { self.audio.cursor = (self.audio.cursor + 1).min(total - 1); }
+            }
+            KeyCode::Up    | KeyCode::Char('k') => {
+                if self.audio.cursor > 0 { self.audio.cursor -= 1; }
+            }
+            KeyCode::Left => {
+                match self.audio.set_volume(-5) {
+                    Ok(()) => self.audio.refresh(),
+                    Err(e) => self.err(e, 4),
+                }
+            }
+            KeyCode::Right => {
+                match self.audio.set_volume(5) {
+                    Ok(()) => self.audio.refresh(),
+                    Err(e) => self.err(e, 4),
+                }
+            }
+            KeyCode::Char(' ') => {
+                match self.audio.toggle_mute() {
+                    Ok(()) => { self.audio.refresh(); self.ok("toggled mute", 2); }
+                    Err(e) => self.err(e, 4),
+                }
+            }
+            KeyCode::Enter => {
+                let (_, port_idx) = self.audio.cursor_info();
+                if port_idx.is_some() {
+                    // Cursor is on a port -- activate it
+                    match self.audio.activate_port() {
+                        Ok(()) => { self.audio.refresh(); self.ok("port activated", 3); }
+                        Err(e) => self.err(e, 4),
+                    }
+                } else {
+                    // Cursor is on device header -- toggle mute
+                    match self.audio.toggle_mute() {
+                        Ok(()) => { self.audio.refresh(); self.ok("toggled mute", 2); }
+                        Err(e) => self.err(e, 4),
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                let kind = if self.audio.section == 0 { "output" } else { "input" };
+                match self.audio.set_default() {
+                    Ok(()) => { self.audio.refresh(); self.ok(format!("default {kind} set"), 3); }
+                    Err(e) => self.err(e, 4),
+                }
+            }
             _ => {}
         }
     }
@@ -357,8 +537,10 @@ fn render(f: &mut Frame, app: &TuiApp) {
     match app.active_tab {
         0 => render_battery(f, app, cols[1]),
         1 => render_system(f, app, cols[1]),
-        2 => render_gpu(f, app, cols[1]),
-        3 => render_settings(f, app, cols[1]),
+        2 => render_cpu(f, app, cols[1]),
+        3 => render_gpu(f, app, cols[1]),
+        4 => render_audio(f, app, cols[1]),
+        5 => render_settings(f, app, cols[1]),
         _ => {}
     }
 }
@@ -372,7 +554,7 @@ fn render_titlebar(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     // Left side
     let mut left: Vec<Span> = vec![
-        Span::styled("  ghelper linux", Style::default().fg(GREEN).add_modifier(Modifier::BOLD).bg(Color::Rgb(11, 11, 11))),
+        Span::styled("  zhelper", Style::default().fg(GREEN).add_modifier(Modifier::BOLD).bg(Color::Rgb(11, 11, 11))),
         Span::styled("  ·  ", fnt().bg(Color::Rgb(11, 11, 11))),
         Span::styled(
             format!("bat {}%", bat.capacity),
@@ -408,7 +590,7 @@ fn render_titlebar(f: &mut Frame, app: &TuiApp, area: Rect) {
 fn render_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
     let focused  = app.focus == Focus::Sidebar;
     let bdr      = if focused { Color::Rgb(45, 45, 45) } else { LINE };
-    let tabs     = ["battery", "system", "gpu", "settings"];
+    let tabs     = ["battery", "system", "cpu", "gpu", "audio", "settings"];
 
     let items: Vec<ListItem> = tabs.iter()
         .map(|&t| ListItem::new(format!("  {t}")).style(dim()))
@@ -711,14 +893,270 @@ fn render_system(f: &mut Frame, app: &TuiApp, area: Rect) {
     }
 }
 
+// ── CPU tab ───────────────────────────────────────────────────────────────────
+
+fn render_cpu(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let focused = app.focus == Focus::Content;
+    let cpu = &app.cpu;
+
+    let rows = Layout::vertical([
+        Constraint::Length(5),  // status: temp + fans
+        Constraint::Length(7),  // thermal profile
+        Constraint::Length(6),  // governor + EPP + boost
+        Constraint::Length(9),  // PPT limits
+        Constraint::Fill(1),    // descriptions / status
+    ]).split(area);
+
+    // ── Status block ─────────────────────────────────────────────────────────
+    {
+        let bdr = if focused { Color::Rgb(40, 40, 40) } else { LINE };
+        let block = Block::default()
+            .title(Span::styled(" cpu status ", dim()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(bdr));
+        let inner = block.inner(rows[0]);
+        f.render_widget(block, rows[0]);
+
+        let cells = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]).split(inner);
+
+        let mut spans: Vec<Span> = vec![];
+        if let Some(t) = cpu.cpu_temp_c {
+            let col = if t >= 85.0 { DANGER } else if t >= 70.0 { DIM } else { TEXT };
+            spans.push(Span::styled("cpu ", dim()));
+            spans.push(Span::styled(format!("{t:.0}°C"), Style::default().fg(col)));
+        }
+        if let Some(rpm) = cpu.fan_cpu_rpm {
+            spans.push(Span::styled("   cpu fan ", dim()));
+            spans.push(Span::styled(format!("{rpm} RPM"), txt()));
+        }
+        if let Some(rpm) = cpu.fan_gpu_rpm {
+            spans.push(Span::styled("   gpu fan ", dim()));
+            spans.push(Span::styled(format!("{rpm} RPM"), txt()));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), cells[0]);
+
+        let mut r2: Vec<Span> = vec![];
+        r2.push(Span::styled("boost ", dim()));
+        r2.push(Span::styled(
+            if cpu.boost_enabled { "on" } else { "off" },
+            if cpu.boost_enabled { g() } else { fnt() },
+        ));
+        r2.push(Span::styled("   governor ", dim()));
+        r2.push(Span::styled(cpu.governor.current.as_str(), txt()));
+        if !cpu.epp.current.is_empty() {
+            r2.push(Span::styled("   epp ", dim()));
+            r2.push(Span::styled(cpu.epp.current.as_str(), txt()));
+        }
+        f.render_widget(Paragraph::new(Line::from(r2)), cells[1]);
+    }
+
+    // ── Thermal profile ───────────────────────────────────────────────────────
+    if cpu.asus_wmi_available {
+        let sec_focused = focused && app.cpu_section == 0;
+        let bdr = if sec_focused { Color::Rgb(35, 60, 45) } else { LINE };
+        let title_col = if sec_focused { GREEN } else { DIM };
+        let block = Block::default()
+            .title(Span::styled(" thermal profile (bios) ", Style::default().fg(title_col)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(bdr));
+        let inner = block.inner(rows[1]);
+        f.render_widget(block, rows[1]);
+
+        let cells = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]).split(inner);
+
+        let mut spans: Vec<Span> = vec![Span::styled("  profile  ", fnt())];
+        for p in ThermalProfile::variants() {
+            let is_active = p == cpu.thermal_profile;
+            let is_pending = p == cpu.pending_thermal;
+            let label = if is_pending { format!("[{}]", p.label()) } else { format!(" {} ", p.label()) };
+            let style = match (is_active, is_pending) {
+                (true, true) => bg(),
+                (false, true) => txt().add_modifier(Modifier::BOLD),
+                (true, false) => g(),
+                (false, false) => dim(),
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::styled("  ", fnt()));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), cells[0]);
+        f.render_widget(Paragraph::new(Span::styled(
+            format!("  {}", cpu.pending_thermal.description()), dim()
+        )), cells[1]);
+        f.render_widget(Paragraph::new(Span::styled("  current value maps to bios fan curve + power limits", fnt())), cells[3]);
+    }
+
+    // ── Governor + EPP + Boost ────────────────────────────────────────────────
+    {
+        let bdr = if focused { Color::Rgb(35, 35, 35) } else { LINE };
+        let block = Block::default()
+            .title(Span::styled(" cpu frequency ", Style::default().fg(if focused { DIM } else { FAINT })))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(bdr));
+        let inner = block.inner(rows[2]);
+        f.render_widget(block, rows[2]);
+
+        let cells = Layout::vertical([
+            Constraint::Length(1), // governor
+            Constraint::Length(1), // epp
+            Constraint::Length(1), // boost
+        ]).split(inner);
+
+        // Governor (section 1)
+        {
+            let sel = focused && app.cpu_section == 1;
+            let cursor = if sel { "▶ " } else { "  " };
+            let mut spans = vec![Span::styled(cursor, if sel { g() } else { fnt() })];
+            spans.push(Span::styled("governor ", dim()));
+            let mut gov_spans: Vec<Span> = vec![];
+            for g_val in &cpu.governor.available {
+                let is_pending = g_val == &cpu.pending_governor;
+                let is_active = g_val == &cpu.governor.current;
+                let label = if is_pending { format!("[{g_val}]") } else { format!(" {g_val} ") };
+                let style = match (is_active, is_pending) {
+                    (true, true) => bg(),
+                    (false, true) => txt().add_modifier(Modifier::BOLD),
+                    (true, false) => Style::default().fg(GREEN),
+                    (false, false) => dim(),
+                };
+                gov_spans.push(Span::styled(label, style));
+            }
+            spans.extend(gov_spans);
+            f.render_widget(Paragraph::new(Line::from(spans)), cells[0]);
+        }
+
+        // EPP (section 2)
+        {
+            let sel = focused && app.cpu_section == 2;
+            let cursor = if sel { "▶ " } else { "  " };
+            let mut spans = vec![Span::styled(cursor, if sel { g() } else { fnt() })];
+            spans.push(Span::styled("epp ", dim()));
+            spans.push(Span::styled(cpu.pending_epp.as_str(), txt()));
+            spans.push(Span::styled("   available: ", fnt()));
+            spans.push(Span::styled(cpu.epp.available.join(" "), fnt()));
+            f.render_widget(Paragraph::new(Line::from(spans)), cells[1]);
+        }
+
+        // Boost (section 3)
+        {
+            let sel = focused && app.cpu_section == 3;
+            let cursor = if sel { "▶ " } else { "  " };
+            let mut spans = vec![Span::styled(cursor, if sel { g() } else { fnt() })];
+            spans.push(Span::styled("cpu boost ", dim()));
+            let is_pending = cpu.pending_boost;
+            let is_active = cpu.boost_enabled;
+            let style = match (is_active, is_pending) {
+                (true, true) => bg(),
+                (false, true) => txt().add_modifier(Modifier::BOLD),
+                (true, false) => Style::default().fg(GREEN),
+                (false, false) => dim(),
+            };
+            spans.push(Span::styled(
+                if is_pending { "[on]  off" } else { " on  [off]" },
+                style,
+            ));
+            f.render_widget(Paragraph::new(Line::from(spans)), cells[2]);
+        }
+    }
+
+    // ── PPT / Power limits ─────────────────────────────────────────────────────
+    if cpu.asus_wmi_available {
+        let bdr = if focused { Color::Rgb(35, 35, 35) } else { LINE };
+        let block = Block::default()
+            .title(Span::styled(" power limits (ppt) ", Style::default().fg(if focused { DIM } else { FAINT })))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(bdr));
+        let inner = block.inner(rows[3]);
+        f.render_widget(block, rows[3]);
+
+        let ppt_rows = [
+            (4, PptKind::ApuSppt, cpu.pending_apu_sppt, cpu.ppt_apu_sppt),
+            (5, PptKind::Fppt, cpu.pending_fppt, cpu.ppt_fppt),
+            (6, PptKind::Pl1Spl, cpu.pending_pl1_spl, cpu.ppt_pl1_spl),
+            (7, PptKind::Pl2Sppt, cpu.pending_pl2_sppt, cpu.ppt_pl2_sppt),
+            (8, PptKind::NvBoost, cpu.pending_nv_boost, cpu.nv_dynamic_boost),
+            (9, PptKind::NvTempTarget, cpu.pending_nv_temp_target, cpu.nv_temp_target),
+        ];
+
+        let mut lines: Vec<Line> = vec![];
+        for (section, kind, pending, current) in &ppt_rows {
+            let sel = focused && app.cpu_section == *section;
+            let cursor = if sel { "▶ " } else { "  " };
+            let changed = pending != current;
+            let pending_val = pending.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+            let current_val = current.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+
+            let style = if changed { g() } else { dim() };
+
+            let mut spans = vec![
+                Span::styled(cursor, if sel { g() } else { fnt() }),
+                Span::styled(format!("{:<22}", kind.label()), style),
+                Span::styled(format!("{:>4}W", pending_val), if changed { txt().add_modifier(Modifier::BOLD) } else { txt() }),
+                Span::styled(format!("  (current: {})", current_val), fnt()),
+            ];
+            if sel {
+                spans.push(Span::styled("  ←→", fnt()));
+            }
+            lines.push(Line::from(spans));
+        }
+        f.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+
+    // ── Description / status ────────────────────────────────────────────────
+    {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(line_border());
+        let inner = block.inner(rows[4]);
+        f.render_widget(block, rows[4]);
+
+        let status_active = !matches!(app.status, Status::None);
+        let mut lines: Vec<Line> = vec![];
+
+        if status_active {
+            match &app.status {
+                Status::Ok(msg) => lines.push(Line::from(vec![Span::styled(format!("  ✓  {msg}"), g())])),
+                Status::Err(msg) => lines.push(Line::from(vec![Span::styled(format!("  ✗  {msg}"), dng())])),
+                Status::None => {}
+            }
+        } else {
+            let desc = match app.cpu_section {
+                0 => cpu.pending_thermal.description(),
+                1 => "CPU governor controls how the kernel scales frequency. Performance = max freq, Powersave = adaptive",
+                2 => "Energy Performance Preference hints the CPU how aggressively to boost",
+                3 => "Turbo boost allows CPU to exceed base clock. Disable to save power and reduce heat",
+                s if s >= 4 && s <= 9 => {
+                    let kinds = [
+                        PptKind::ApuSppt, PptKind::Fppt, PptKind::Pl1Spl,
+                        PptKind::Pl2Sppt, PptKind::NvBoost, PptKind::NvTempTarget,
+                    ];
+                    kinds[s - 4].description()
+                }
+                _ => "",
+            };
+            if !desc.is_empty() {
+                lines.push(Line::from(Span::styled(format!("  {desc}"), dim())));
+            }
+        }
+
+        f.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+}
+
 // ── GPU tab ───────────────────────────────────────────────────────────────────
 
 fn render_gpu(f: &mut Frame, app: &TuiApp, area: Rect) {
     let focused = app.focus == Focus::Content;
 
     let rows = Layout::vertical([
-        Constraint::Length(7),  // GPU mode block (names + selector + desc + spacer + action)
-        Constraint::Length(6),  // power profile block
+        Constraint::Length(7),  // GPU mode block
         Constraint::Fill(1),
     ]).split(area);
 
@@ -726,9 +1164,8 @@ fn render_gpu(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     // ── GPU Mode block ────────────────────────────────────────────────────────
     {
-        let sec_focused = focused && app.gpu_section == 0;
-        let bdr       = if sec_focused { Color::Rgb(35, 60, 45) } else { LINE };
-        let title_col = if sec_focused { GREEN } else { DIM };
+        let bdr       = if focused { Color::Rgb(35, 60, 45) } else { LINE };
+        let title_col = if focused { GREEN } else { DIM };
 
         let block = Block::default()
             .title(Span::styled(" graphics mode ", Style::default().fg(title_col)))
@@ -760,7 +1197,7 @@ fn render_gpu(f: &mut Frame, app: &TuiApp, area: Rect) {
             f.render_widget(Paragraph::new(Line::from(spans)), cells[0]);
         }
 
-        if app.gpu.envycontrol_available {
+        if app.gpu.asus_wmi_available {
             // Selector row  [cells[1]]
             let mut spans: Vec<Span> = vec![Span::styled("  mode  ", fnt())];
             for mode in GpuMode::variants() {
@@ -776,7 +1213,7 @@ fn render_gpu(f: &mut Frame, app: &TuiApp, area: Rect) {
                 spans.push(Span::styled(label, style));
                 spans.push(Span::styled("  ", fnt()));
             }
-            if sec_focused { spans.push(Span::styled("← →", fnt())); }
+            if focused { spans.push(Span::styled("← →", fnt())); }
             f.render_widget(Paragraph::new(Line::from(spans)), cells[1]);
 
             // Description  [cells[2]]
@@ -786,12 +1223,7 @@ fn render_gpu(f: &mut Frame, app: &TuiApp, area: Rect) {
             );
 
             // Action line  [cells[4]]
-            let action = if app.gpu.needs_reboot && app.gpu.pending_mode == app.gpu.mode {
-                Paragraph::new(Line::from(vec![
-                    Span::styled("  ✓ mode staged  ", g()),
-                    Span::styled("reboot to apply", dim()),
-                ]))
-            } else if status_active && app.gpu_last_section == 0 {
+            let action = if status_active {
                 match &app.status {
                     Status::Ok(msg)  => Paragraph::new(Line::from(vec![Span::styled("  ✓  ", g()),   Span::styled(msg.as_str(), g())])),
                     Status::Err(msg) => Paragraph::new(Line::from(vec![Span::styled("  ✗  ", dng()), Span::styled(msg.as_str(), dng())])),
@@ -801,89 +1233,170 @@ fn render_gpu(f: &mut Frame, app: &TuiApp, area: Rect) {
                 let changed = app.gpu.pending_mode != app.gpu.mode;
                 Paragraph::new(Line::from(vec![
                     Span::styled("  [a/↵] apply  ", if changed { g() } else { dim() }),
-                    Span::styled("requires reboot", fnt()),
+                    Span::styled("changes immediately", fnt()),
                 ]))
             };
             f.render_widget(action, cells[4]);
         } else {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  envycontrol not found  ", dng()),
-                    Span::styled("install: github.com/bayasdev/envycontrol", dim()),
+                    Span::styled("  ASUS GPU control not available  ", dng()),
+                    Span::styled("requires asus-nb-wmi kernel module", dim()),
                 ])),
                 cells[1],
             );
         }
     }
+}
 
-    // ── Power Profile block ───────────────────────────────────────────────────
+// ── Audio tab ─────────────────────────────────────────────────────────────────
+
+fn render_audio(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let focused = app.focus == Focus::Content;
+    let active_section = app.audio.section;
+
+    let rows = Layout::vertical([
+        Constraint::Length(10), // output
+        Constraint::Length(10), // input
+        Constraint::Fill(1),    // status
+    ]).split(area);
+
+    let section_label = if active_section == 0 { "output" } else { "input" };
+
+    // ── Output ───────────────────────────────────────────────────────────────
     {
-        let sec_focused = focused && app.gpu_section == 1;
-        let bdr       = if sec_focused { Color::Rgb(35, 60, 45) } else { LINE };
+        let sec_focused = focused && active_section == 0;
+        let bdr = if sec_focused { Color::Rgb(35, 60, 45) } else { LINE };
         let title_col = if sec_focused { GREEN } else { DIM };
-
         let block = Block::default()
-            .title(Span::styled(" power profile ", Style::default().fg(title_col)))
+            .title(Span::styled(" output (speakers / headphones) ", Style::default().fg(title_col)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(bdr));
+        let inner = block.inner(rows[0]);
+        f.render_widget(block, rows[0]);
+
+        if app.audio.sinks.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled("  no output devices found", fnt())), inner);
+        } else {
+            let cursor = if active_section == 0 { app.audio.cursor } else { 999 };
+            let lines = render_device_list(&app.audio.sinks, sec_focused, cursor);
+            f.render_widget(Paragraph::new(Text::from(lines)), inner);
+        }
+    }
+
+    // ── Input ────────────────────────────────────────────────────────────────
+    {
+        let sec_focused = focused && active_section == 1;
+        let bdr = if sec_focused { Color::Rgb(35, 60, 45) } else { LINE };
+        let title_col = if sec_focused { GREEN } else { DIM };
+        let block = Block::default()
+            .title(Span::styled(" input (microphones) ", Style::default().fg(title_col)))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(bdr));
         let inner = block.inner(rows[1]);
         f.render_widget(block, rows[1]);
 
-        let cells = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ]).split(inner);
-
-        if app.gpu.platform_profile_available {
-            // Selector row
-            let mut spans: Vec<Span> = vec![Span::styled("  profile  ", fnt())];
-            for profile in PowerProfile::variants() {
-                let is_active  = profile == app.gpu.power_profile;
-                let is_pending = profile == app.gpu.pending_profile;
-                let label = if is_pending { format!("[{}]", profile.label()) } else { format!(" {} ", profile.label()) };
-                let style = match (is_active, is_pending) {
-                    (true,  true)  => bg(),
-                    (false, true)  => txt().add_modifier(Modifier::BOLD),
-                    (true,  false) => g(),
-                    (false, false) => dim(),
-                };
-                spans.push(Span::styled(label, style));
-                spans.push(Span::styled("  ", fnt()));
-            }
-            if sec_focused { spans.push(Span::styled("← →", fnt())); }
-            f.render_widget(Paragraph::new(Line::from(spans)), cells[0]);
-
-            // Description
-            f.render_widget(
-                Paragraph::new(Span::styled(format!("  {}", app.gpu.pending_profile.description()), dim())),
-                cells[1],
-            );
-
-            // Action line
-            let action = if status_active && app.gpu_last_section == 1 {
-                match &app.status {
-                    Status::Ok(msg)  => Paragraph::new(Line::from(vec![Span::styled("  ✓  ", g()),   Span::styled(msg.as_str(), g())])),
-                    Status::Err(msg) => Paragraph::new(Line::from(vec![Span::styled("  ✗  ", dng()), Span::styled(msg.as_str(), dng())])),
-                    Status::None     => Paragraph::new(Line::from(vec![])),
-                }
-            } else {
-                let changed = app.gpu.pending_profile != app.gpu.power_profile;
-                Paragraph::new(Span::styled("  [a/↵] apply", if changed { g() } else { dim() }))
-            };
-            f.render_widget(action, cells[3]);
+        if app.audio.sources.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled("  no input devices found", fnt())), inner);
         } else {
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    "  platform_profile not available on this kernel",
-                    dng(),
-                )),
-                cells[0],
-            );
+            let cursor = if active_section == 1 { app.audio.cursor } else { 999 };
+            let lines = render_device_list(&app.audio.sources, sec_focused, cursor);
+            f.render_widget(Paragraph::new(Text::from(lines)), inner);
         }
     }
+
+    // ── Status / hints ────────────────────────────────────────────────────────
+    {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(line_border());
+        let inner = block.inner(rows[2]);
+        f.render_widget(block, rows[2]);
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                format!("  section: {section_label}  -  tab to switch"),
+                dim(),
+            )),
+            Line::from(""),
+        ];
+
+        if !matches!(app.status, Status::None) {
+            match &app.status {
+                Status::Ok(msg)  => lines.push(Line::from(vec![Span::styled(format!("  check {msg}"), g())])),
+                Status::Err(msg) => lines.push(Line::from(vec![Span::styled(format!("  x  {msg}"), dng())])),
+                Status::None => {}
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  j/k navigate   enter activate port   space mute   d default",
+                fnt(),
+            )));
+        }
+
+        f.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+}
+
+fn render_device_list(devices: &[crate::audio::AudioDevice], focused: bool, cursor: usize) -> Vec<Line> {
+    let mut lines: Vec<Line> = vec![];
+    let mut row = 0usize;
+
+    for dev in devices {
+        // Device header row
+        let sel = focused && row == cursor;
+        let prefix = if sel { "> " } else { "  " };
+        let default_mark = if dev.is_default { "* " } else { "  " };
+        let mute_label = if dev.muted { " [MUTED]" } else { "" };
+        let vol_pct = (dev.volume * 100.0).round() as u32;
+
+        let name_col = if sel { txt() } else { dim() };
+        let vol_col = if dev.muted { dng() } else if sel { txt().add_modifier(Modifier::BOLD) } else { txt() };
+        let mute_col = if dev.muted { dng() } else { g() };
+
+        lines.push(Line::from(vec![
+            Span::styled(prefix, if sel { g() } else { fnt() }),
+            Span::styled(default_mark, g()),
+            Span::styled(format!("{:<30}", dev.display_name), name_col),
+            Span::styled(format!("{:>4}%", vol_pct), vol_col),
+            Span::styled(mute_label, mute_col),
+        ]));
+        row += 1;
+
+        // Port rows
+        for port in &dev.ports {
+            let sel = focused && row == cursor;
+            let marker = if port.is_active { "  * " } else { "    " };
+            let prefix = if sel { "> " } else { "  " };
+
+            let port_col = if port.is_active {
+                g()
+            } else if sel {
+                txt().add_modifier(Modifier::BOLD)
+            } else if port.available {
+                txt()
+            } else {
+                fnt()
+            };
+            let status = if port.is_active {
+                "  (active)"
+            } else if !port.available {
+                "  (unavailable)"
+            } else {
+                ""
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, if sel { g() } else { fnt() }),
+                Span::styled(marker, port_col),
+                Span::styled(&port.display_name, port_col),
+                Span::styled(status, fnt()),
+            ]));
+            row += 1;
+        }
+    }
+
+    lines
 }
 
 // ── Settings tab ──────────────────────────────────────────────────────────────
@@ -950,8 +1463,10 @@ fn render_statusbar(f: &mut Frame, app: &TuiApp, area: Rect) {
     let keys = match (app.active_tab, app.focus) {
         (0, Focus::Content) => "  q quit   tab→sidebar   ←→ limit   shift+←→ ±5   1/2/3 presets   a/↵ apply   s setup/persist   r refresh",
         (1, Focus::Content) => "  q quit   tab→sidebar   r refresh",
-        (2, Focus::Content) => "  q quit   tab→sidebar   j/k section   ← → select   a/↵ apply   r refresh",
-        (3, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space/↵ toggle   r refresh",
+        (2, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space toggle   a/↵ apply   r refresh",
+        (3, Focus::Content) => "  q quit   tab→sidebar   ← → select mode   a/↵ apply   r refresh",
+        (4, Focus::Content) => "  q quit   tab output/input   j/k navigate   enter activate port   space mute   d default",
+        (5, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space/↵ toggle   r refresh",
         (_, Focus::Sidebar)  => "  q quit   j/k navigate   ↵/→ select tab   tab→content   r refresh",
         _                    => "  q quit",
     };

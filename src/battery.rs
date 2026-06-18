@@ -270,7 +270,7 @@ impl BatteryManager {
 set -e
 
 RULE_FILE="/etc/udev/rules.d/50-battery-charging-threshold.rules"
-CONF_DIR="/etc/ghelper-linux"
+CONF_DIR="/etc/zhelper"
 CONF_FILE="$CONF_DIR/charge_limit"
 SERVICE_FILE="/etc/systemd/system/battery-charge-limit.service"
 
@@ -294,7 +294,7 @@ After=hibernate.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/bash -c "cat /etc/ghelper-linux/charge_limit | xargs -I{{}} bash -c 'echo {{}} | tee /sys/class/power_supply/{bat}/charge_control_end_threshold'"
+ExecStart=/usr/bin/bash -c "cat /etc/zhelper/charge_limit | xargs -I{{}} bash -c 'echo {{}} | tee /sys/class/power_supply/{bat}/charge_control_end_threshold'"
 RemainAfterExit=yes
 
 [Install]
@@ -308,13 +308,13 @@ systemctl enable --now battery-charge-limit.service
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=power_supply
 
-echo "GHelper Linux setup complete."
+echo "ZHelper setup complete."
 "#,
             limit = limit,
             bat   = bat_name,
         );
 
-        let tmp = "/tmp/ghelper-linux-setup.sh";
+        let tmp = "/tmp/zhelper-setup.sh";
         fs::write(tmp, &script).map_err(|e| format!("Failed to write setup script: {e}"))?;
 
         let out = Command::new("pkexec")
@@ -334,9 +334,9 @@ echo "GHelper Linux setup complete."
         }
     }
 
-    /// Update the persistent limit stored in /etc/ghelper-linux/charge_limit
+    /// Update the persistent limit stored in /etc/zhelper/charge_limit
     pub fn update_persistent_limit(&self, limit: u8) -> Result<(), String> {
-        let conf = "/etc/ghelper-linux/charge_limit";
+        let conf = "/etc/zhelper/charge_limit";
         let value = limit.to_string();
 
         match fs::write(conf, &value) {

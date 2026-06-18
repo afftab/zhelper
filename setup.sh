@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GHelper Linux — system setup
+# ZHelper — system setup
 # Run with: sudo bash setup.sh [charge_limit]
 # Default charge limit: 80%
 set -e
@@ -41,7 +41,7 @@ SUBSYSTEM=="power_supply", KERNEL=="BAT[01CT]", ACTION=="add|change", \
 RULE_EOF
 
 # 2. Config directory
-CONF_DIR="/etc/ghelper-linux"
+CONF_DIR="/etc/zhelper"
 echo "Creating config directory: $CONF_DIR"
 mkdir -p "$CONF_DIR"
 echo "$LIMIT" > "$CONF_DIR/charge_limit"
@@ -51,12 +51,12 @@ SERVICE_FILE="/etc/systemd/system/battery-charge-limit.service"
 echo "Creating systemd service: $SERVICE_FILE"
 cat > "$SERVICE_FILE" << SVC_EOF
 [Unit]
-Description=Set ASUS battery charge limit (GHelper Linux)
+Description=Set ASUS battery charge limit (ZHelper)
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/bash -c "echo \$(cat /etc/ghelper-linux/charge_limit) > /sys/class/power_supply/${BAT}/charge_control_end_threshold"
+ExecStart=/usr/bin/bash -c "echo \$(cat /etc/zhelper/charge_limit) > /sys/class/power_supply/${BAT}/charge_control_end_threshold"
 RemainAfterExit=yes
 
 [Install]
