@@ -5,42 +5,62 @@ use std::process::Command;
 use crate::sysutil;
 
 const DGPU_DISABLE: &str = "/sys/devices/platform/asus-nb-wmi/dgpu_disable";
+const GPU_MUX_MODE: &str = "/sys/devices/platform/asus-nb-wmi/gpu_mux_mode";
+const PENDING_FILE: &str = "/etc/zhelper/gpu_pending";
 
 // ── GpuMode ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum GpuMode {
-    Eco,
-    Standard,
+    Integrated,
+    Hybrid,
+    Ultimate,
     Unknown,
 }
 
 impl GpuMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Eco      => "Eco",
-            Self::Standard => "Standard",
-            Self::Unknown  => "Unknown",
+            Self::Integrated => "Integrated",
+            Self::Hybrid     => "Hybrid",
+            Self::Ultimate   => "Ultimate",
+            Self::Unknown    => "Unknown",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Eco      => "dGPU off, iGPU only  -  best battery life",
-            Self::Standard => "iGPU + dGPU both active  -  on-demand rendering",
-            Self::Unknown  => "",
+            Self::Integrated => "iGPU only, dGPU powered off - best battery life",
+            Self::Hybrid     => "iGPU + dGPU both active, on-demand rendering",
+            Self::Ultimate   => "dGPU as primary via MUX - best performance",
+            Self::Unknown    => "",
         }
     }
 
-    pub fn variants() -> [Self; 2] {
-        [Self::Eco, Self::Standard]
+    pub fn variants(has_mux: bool) -> &'static [Self] {
+        if has_mux {
+            &[Self::Integrated, Self::Hybrid, Self::Ultimate]
+        } else {
+            &[Self::Integrated, Self::Hybrid]
+        }
     }
 
-    pub fn index(self) -> usize {
+    pub fn index(self, has_mux: bool) -> usize {
         match self {
-            Self::Eco      => 0,
-            Self::Standard => 1,
-            Self::Unknown  => 0,
+            Self::Integrated => 0,
+            Self::Hybrid     => 1,
+            Self::Ultimate   => if has_mux { 2 } else { 1 },
+            Self::Unknown    => 0,
+        }
+    }
+
+    /// Returns (dgpu_disable, gpu_mux_mode) values for this mode.
+    fn firmware_values(self) -> (u8, u8) {
+        match self {
+            Self::Integrated => (1, 1),
+            Self::Hybrid     => (0, 1),
+            Self::Ultimate   => (0, 0),
+            Self::Unknown    => (0, 1),
         }
     }
 }
@@ -50,6 +70,8 @@ impl GpuMode {
 pub struct GpuManager {
     pub mode: GpuMode,
     pub pending_mode: GpuMode,
+    pub queued_mode: Option<GpuMode>,
+    pub has_mux: bool,
     pub asus_wmi_available: bool,
     pub igpu_name: Option<String>,
     pub dgpu_name: Option<String>,
@@ -58,18 +80,23 @@ pub struct GpuManager {
 impl GpuManager {
     pub fn new() -> Self {
         let asus_wmi_available = Path::new(DGPU_DISABLE).exists();
+        let has_mux = Path::new(GPU_MUX_MODE).exists();
 
         let mode = if asus_wmi_available {
-            Self::read_mode()
+            Self::read_mode(has_mux)
         } else {
             GpuMode::Unknown
         };
 
+        let queued_mode = Self::read_queued_mode(has_mux);
+
         let (igpu_name, dgpu_name) = read_gpu_names();
 
         Self {
-            pending_mode: mode,
+            pending_mode: queued_mode.unwrap_or(mode),
             mode,
+            queued_mode,
+            has_mux,
             asus_wmi_available,
             igpu_name,
             dgpu_name,
@@ -78,36 +105,77 @@ impl GpuManager {
 
     pub fn refresh(&mut self) {
         if self.asus_wmi_available {
-            self.mode = Self::read_mode();
+            self.mode = Self::read_mode(self.has_mux);
         }
+        self.queued_mode = Self::read_queued_mode(self.has_mux);
     }
 
-    fn read_mode() -> GpuMode {
-        let val = fs::read_to_string(DGPU_DISABLE)
+    fn read_mode(has_mux: bool) -> GpuMode {
+        let dgpu = fs::read_to_string(DGPU_DISABLE)
             .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
+            .and_then(|s| s.trim().parse::<u8>().ok());
 
-        match val {
-            Some(1) => GpuMode::Eco,
-            Some(0) => GpuMode::Standard,
-            _ => GpuMode::Unknown,
+        if has_mux {
+            let mux = fs::read_to_string(GPU_MUX_MODE)
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok());
+            match (dgpu, mux) {
+                (Some(1), _)      => GpuMode::Integrated,
+                (_, Some(0))      => GpuMode::Ultimate,
+                (_, _)            => GpuMode::Hybrid,
+            }
+        } else {
+            match dgpu {
+                Some(1) => GpuMode::Integrated,
+                Some(0) => GpuMode::Hybrid,
+                _       => GpuMode::Unknown,
+            }
         }
     }
 
-    /// Apply GPU mode via ASUS WMI dgpu_disable.
-    pub fn apply_gpu_mode(&mut self) -> Result<(), String> {
+    fn read_queued_mode(has_mux: bool) -> Option<GpuMode> {
+        let data = fs::read_to_string(PENDING_FILE).ok()?;
+        let parts: Vec<&str> = data.trim().split(',').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let dgpu: u8 = parts[0].trim().parse().ok()?;
+        let mux: u8 = parts[1].trim().parse().ok()?;
+        if has_mux {
+            match (dgpu, mux) {
+                (1, _)      => Some(GpuMode::Integrated),
+                (_, 0)      => Some(GpuMode::Ultimate),
+                _           => Some(GpuMode::Hybrid),
+            }
+        } else {
+            match dgpu {
+                1 => Some(GpuMode::Integrated),
+                0 => Some(GpuMode::Hybrid),
+                _ => None,
+            }
+        }
+    }
+
+    /// Queue GPU mode change. The actual firmware write happens at shutdown
+    /// via the zhelper-gpu-shutdown systemd service.
+    pub fn queue_gpu_mode(&mut self) -> Result<(), String> {
         if !self.asus_wmi_available {
-            return Err("ASUS WMI dgpu_disable not available on this device".to_string());
+            return Err("ASUS WMI not available on this device".to_string());
         }
 
-        let disable = match self.pending_mode {
-            GpuMode::Eco      => 1,
-            GpuMode::Standard => 0,
-            GpuMode::Unknown  => return Err("Unknown GPU mode".to_string()),
-        };
+        let (dgpu, mux) = self.pending_mode.firmware_values();
+        let data = format!("{dgpu},{mux}\n");
 
-        sysutil::write_asus("dgpu_disable", &disable.to_string())?;
-        self.mode = self.pending_mode;
+        // Try direct write to pending file
+        match fs::write(PENDING_FILE, &data) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                sysutil::write_privileged(PENDING_FILE, &data)?;
+            }
+            Err(e) => return Err(format!("Failed to write GPU config: {e}")),
+        }
+
+        self.queued_mode = Some(self.pending_mode);
         Ok(())
     }
 }

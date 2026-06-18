@@ -146,7 +146,7 @@ fn guess_cpu_temp(zones: &[ThermalZone]) -> Option<f32> {
 }
 
 fn guess_gpu_temp(zones: &[ThermalZone]) -> Option<f32> {
-    let gpu_names = ["nouveau", "amdgpu", "nvidia", "gpu", "AMDGPU", "Tdie"];
+    let gpu_names = ["nouveau", "amdgpu", "nvidia", "gpu", "AMDGPU"];
     for name in &gpu_names {
         if let Some(z) = zones.iter().find(|z| z.name.to_lowercase().contains(&name.to_lowercase())) {
             return Some(z.temp_c);

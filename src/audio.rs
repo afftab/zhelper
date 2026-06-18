@@ -150,6 +150,7 @@ fn err_msg(stderr: &[u8]) -> String {
 
 fn parse_pactl_devices(raw: &str, is_source: bool) -> Vec<AudioDevice> {
     let block_prefix = if is_source { "Source #" } else { "Sink #" };
+    let default_name = get_default_device(is_source);
     let mut devices = vec![];
 
     for block in raw.split(block_prefix).skip(1) {
@@ -218,7 +219,7 @@ fn parse_pactl_devices(raw: &str, is_source: bool) -> Vec<AudioDevice> {
             continue;
         }
 
-        let is_default = check_is_default(&name, is_source);
+        let is_default = default_name.as_deref() == Some(name.as_str());
 
         if !name.is_empty() {
             devices.push(AudioDevice {
@@ -236,7 +237,7 @@ fn parse_pactl_devices(raw: &str, is_source: bool) -> Vec<AudioDevice> {
     devices
 }
 
-fn check_is_default(pactl_name: &str, is_source: bool) -> bool {
+fn get_default_device(is_source: bool) -> Option<String> {
     let cmd = if is_source { "get-default-source" } else { "get-default-sink" };
     Command::new("pactl")
         .args([cmd])
@@ -244,8 +245,7 @@ fn check_is_default(pactl_name: &str, is_source: bool) -> bool {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == pactl_name)
-        .unwrap_or(false)
+        .map(|s| s.trim().to_string())
 }
 
 fn clean_name(name: &str) -> String {

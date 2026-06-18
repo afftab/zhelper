@@ -1,7 +1,8 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+use crate::sysutil;
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
@@ -226,35 +227,8 @@ impl BatteryManager {
             Err(e) => return Err(format!("Write error: {e}")),
         }
 
-        // Attempt 2 — pkexec tee (shows native GNOME auth dialog)
-        BatteryManager::write_privileged(&threshold_path.to_string_lossy(), &value)
-    }
-
-    fn write_privileged(path: &str, value: &str) -> Result<(), String> {
-        let mut child = Command::new("pkexec")
-            .args(["tee", path])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to launch pkexec: {e}\nRun Setup to configure permissions."))?;
-
-        if let Some(ref mut stdin) = child.stdin {
-            stdin.write_all(value.as_bytes())
-                .map_err(|e| format!("Stdin write error: {e}"))?;
-        }
-
-        let out = child.wait_with_output()
-            .map_err(|e| format!("pkexec wait failed: {e}"))?;
-
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Permission denied.\nRun Setup to configure passwordless battery control.\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            ))
-        }
+        // Attempt 2 -- pkexec tee (shows native GNOME auth dialog)
+        sysutil::write_privileged(&threshold_path.to_string_lossy(), &value)
     }
 
     // ── Persistent setup (udev + systemd) ────────────────────────────────────
@@ -308,21 +282,47 @@ systemctl enable --now battery-charge-limit.service
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=power_supply
 
+# 5. GPU shutdown service — applies pending GPU mode change at shutdown
+GPU_SHUTDOWN_SERVICE="/etc/systemd/system/zhelper-gpu-shutdown.service"
+cat > "$GPU_SHUTDOWN_SERVICE" << 'GPU_SVC_EOF'
+[Unit]
+Description=Apply pending ZHelper GPU mode change at shutdown
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+After=graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/usr/bin/bash -c 'f=/etc/zhelper/gpu_pending; if [ -f "$f" ]; then IFS="," read dgpu mux < "$f"; echo "$dgpu" > /sys/devices/platform/asus-nb-wmi/dgpu_disable 2>/dev/null || true; echo "$mux" > /sys/devices/platform/asus-nb-wmi/gpu_mux_mode 2>/dev/null || true; rm -f "$f"; fi'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target
+GPU_SVC_EOF
+
+systemctl daemon-reload
+systemctl enable zhelper-gpu-shutdown.service 2>/dev/null || true
+
 echo "ZHelper setup complete."
 "#,
             limit = limit,
             bat   = bat_name,
         );
 
-        let tmp = "/tmp/zhelper-setup.sh";
-        fs::write(tmp, &script).map_err(|e| format!("Failed to write setup script: {e}"))?;
+        let tmp = std::env::temp_dir().join(format!(
+            "zhelper-setup-{}.sh",
+            std::process::id()
+        ));
+        let tmp_str = tmp.to_string_lossy().to_string();
+        fs::write(&tmp, &script).map_err(|e| format!("Failed to write setup script: {e}"))?;
 
         let out = Command::new("pkexec")
-            .args(["bash", tmp])
+            .args(["bash", &tmp_str])
             .output()
             .map_err(|e| format!("pkexec failed: {e}"))?;
 
-        let _ = fs::remove_file(tmp);
+        let _ = fs::remove_file(&tmp);
 
         if out.status.success() {
             Ok(())
@@ -345,7 +345,7 @@ echo "ZHelper setup complete."
             Err(e) => return Err(e.to_string()),
         }
 
-        Self::write_privileged(conf, &value)
+        sysutil::write_privileged(conf, &value)
     }
 
     pub fn bat_name(&self) -> &str {

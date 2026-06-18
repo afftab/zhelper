@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Desired charge limit (20–100)
+    /// Desired charge limit (20-100)
     pub charge_limit: u8,
     /// Apply charge limit on app startup
     pub auto_apply_on_start: bool,
@@ -12,6 +12,8 @@ pub struct Config {
     pub persistent_limit: bool,
     /// Refresh interval in seconds
     pub refresh_secs: u64,
+    /// Persisted CPU boost state (true = enabled)
+    pub boost_enabled: Option<bool>,
 }
 
 impl Default for Config {
@@ -21,6 +23,7 @@ impl Default for Config {
             auto_apply_on_start: false,
             persistent_limit: false,
             refresh_secs: 5,
+            boost_enabled: None,
         }
     }
 }

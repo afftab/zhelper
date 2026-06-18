@@ -3,6 +3,7 @@ mod audio;
 mod battery;
 mod config;
 mod cpu;
+mod display;
 mod gpu;
 mod sysutil;
 mod system;
