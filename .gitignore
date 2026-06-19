@@ -2,3 +2,6 @@
 Cargo.lock
 .env
 *.log
+*.desktop
+vicinae/
+launch_zhelper.sh
