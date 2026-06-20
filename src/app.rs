@@ -2,6 +2,7 @@
 // Layout inspired by spotify-tui: sidebar + content + status bar.
 // Single phosphor-green accent, near-black ground, minimal chrome.
 
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Sparkline},
     Frame, Terminal,
 };
 
@@ -47,6 +48,29 @@ fn dng() -> Style { Style::default().fg(DANGER) }
 fn bg()  -> Style { Style::default().fg(GREEN).add_modifier(Modifier::BOLD) }
 fn line_border() -> Style { Style::default().fg(LINE) }
 
+// ── History ring buffer for sparkline graphs ──────────────────────────────────
+
+const HISTORY_LEN: usize = 60;
+
+#[derive(Clone, Default)]
+pub(crate) struct History {
+    buf: VecDeque<u64>,
+    cached: Vec<u64>,
+}
+
+impl History {
+    fn push(&mut self, v: u64) {
+        if self.buf.len() >= HISTORY_LEN {
+            self.buf.pop_front();
+        }
+        self.buf.push_back(v);
+        self.cached = self.buf.iter().copied().collect();
+    }
+    fn data(&self) -> &Vec<u64> {
+        &self.cached
+    }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
@@ -72,6 +96,14 @@ pub struct TuiApp {
     pub should_quit:      bool,
     pub settings_cursor:  usize,
     pub cpu_section:      usize,  // which row in cpu tab is focused
+    // Overview sparkline history
+    pub hist_cpu_temp:    History,
+    pub hist_gpu_temp:    History,
+    pub hist_mem_pct:     History,
+    pub hist_bat_pct:     History,
+    pub hist_fan_cpu:     History,
+    pub hist_fan_gpu:     History,
+    pub needs_redraw:     bool,
 }
 
 impl TuiApp {
@@ -96,6 +128,13 @@ impl TuiApp {
             should_quit: false,
             settings_cursor: 0,
             cpu_section: 0,
+            hist_cpu_temp: History::default(),
+            hist_gpu_temp: History::default(),
+            hist_mem_pct: History::default(),
+            hist_bat_pct: History::default(),
+            hist_fan_cpu: History::default(),
+            hist_fan_gpu: History::default(),
+            needs_redraw: true,
         };
         if app.config.auto_apply_on_start {
             let _ = app.battery.set_charge_limit(app.desired_limit);
@@ -117,6 +156,25 @@ impl TuiApp {
         self.audio.refresh();
         self.display.refresh();
         self.last_refresh = Instant::now();
+
+        // Update overview history (push current values)
+        if let Some(t) = self.system.cpu_temp_c {
+            self.hist_cpu_temp.push((t.round() as i64).max(0) as u64);
+        }
+        if let Some(t) = self.system.gpu_temp_c {
+            self.hist_gpu_temp.push((t.round() as i64).max(0) as u64);
+        }
+        if let Some(p) = self.system.mem_used_percent() {
+            self.hist_mem_pct.push(p.round() as u64);
+        }
+        self.hist_bat_pct.push(self.battery.info.capacity as u64);
+        if let Some(r) = self.cpu.fan_cpu_rpm {
+            self.hist_fan_cpu.push(r as u64);
+        }
+        if let Some(r) = self.cpu.fan_gpu_rpm {
+            self.hist_fan_gpu.push(r as u64);
+        }
+        self.needs_redraw = true;
     }
 
     fn expire_status(&mut self) {
@@ -124,6 +182,7 @@ impl TuiApp {
             if Instant::now() > until {
                 self.status = Status::None;
                 self.status_until = Option::None;
+                self.needs_redraw = true;
             }
         }
     }
@@ -131,11 +190,13 @@ impl TuiApp {
     fn ok(&mut self, msg: impl Into<String>, secs: u64) {
         self.status = Status::Ok(msg.into());
         self.status_until = Some(Instant::now() + Duration::from_secs(secs));
+        self.needs_redraw = true;
     }
 
     fn err(&mut self, msg: impl Into<String>, secs: u64) {
         self.status = Status::Err(msg.into());
         self.status_until = Some(Instant::now() + Duration::from_secs(secs));
+        self.needs_redraw = true;
     }
 
     fn do_apply(&mut self) {
@@ -179,13 +240,14 @@ impl TuiApp {
     // ── Input ─────────────────────────────────────────────────────────────────
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        self.needs_redraw = true;
         // Global
         match code {
             KeyCode::Char('q') | KeyCode::Char('Q') => { self.should_quit = true; return; }
             KeyCode::Char('r') | KeyCode::Char('R') => { self.refresh(); return; }
             KeyCode::Tab => {
                 // In audio tab, Tab switches between speakers/mics
-                if self.active_tab == 4 && self.focus == Focus::Content {
+                if self.active_tab == 5 && self.focus == Focus::Content {
                     // fall through to content_key
                 } else {
                     self.focus = if self.focus == Focus::Sidebar { Focus::Content } else { Focus::Sidebar };
@@ -202,7 +264,7 @@ impl TuiApp {
 
     fn sidebar_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Down  | KeyCode::Char('j') => self.active_tab = (self.active_tab + 1).min(6),
+            KeyCode::Down  | KeyCode::Char('j') => self.active_tab = (self.active_tab + 1).min(7),
             KeyCode::Up    | KeyCode::Char('k') => { if self.active_tab > 0 { self.active_tab -= 1; } }
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.focus = Focus::Content,
             _ => {}
@@ -215,13 +277,14 @@ impl TuiApp {
             _ => {}
         }
         match self.active_tab {
-            0 => self.battery_key(code, mods),
-            1 => {} // system tab -- read-only
-            2 => self.cpu_key(code),
-            3 => self.gpu_key(code),
-            4 => self.audio_key(code),
-            5 => self.display_key(code),
-            6 => self.settings_key(code),
+            0 => {} // overview tab -- read-only dashboard
+            1 => self.battery_key(code, mods),
+            2 => {} // system tab -- read-only
+            3 => self.cpu_key(code),
+            4 => self.gpu_key(code),
+            5 => self.audio_key(code),
+            6 => self.display_key(code),
+            7 => self.settings_key(code),
             _ => {}
         }
     }
@@ -480,7 +543,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut app  = TuiApp::new();
 
     loop {
-        term.draw(|f| render(f, &app))?;
+        if app.needs_redraw {
+            term.draw(|f| render(f, &app))?;
+            app.needs_redraw = false;
+        }
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, modifiers, .. }) = event::read()? {
@@ -525,13 +591,14 @@ fn render(f: &mut Frame, app: &TuiApp) {
     render_sidebar(f, app, cols[0]);
 
     match app.active_tab {
-        0 => render_battery(f, app, cols[1]),
-        1 => render_system(f, app, cols[1]),
-        2 => render_cpu(f, app, cols[1]),
-        3 => render_gpu(f, app, cols[1]),
-        4 => render_audio(f, app, cols[1]),
-        5 => render_display(f, app, cols[1]),
-        6 => render_settings(f, app, cols[1]),
+        0 => render_overview(f, app, cols[1]),
+        1 => render_battery(f, app, cols[1]),
+        2 => render_system(f, app, cols[1]),
+        3 => render_cpu(f, app, cols[1]),
+        4 => render_gpu(f, app, cols[1]),
+        5 => render_audio(f, app, cols[1]),
+        6 => render_display(f, app, cols[1]),
+        7 => render_settings(f, app, cols[1]),
         _ => {}
     }
 }
@@ -581,7 +648,7 @@ fn render_titlebar(f: &mut Frame, app: &TuiApp, area: Rect) {
 fn render_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
     let focused  = app.focus == Focus::Sidebar;
     let bdr      = if focused { Color::Rgb(45, 45, 45) } else { LINE };
-    let tabs     = ["battery", "system", "cpu", "gpu", "audio", "display", "settings"];
+    let tabs     = ["overview", "battery", "system", "cpu", "gpu", "audio", "display", "settings"];
 
     let items: Vec<ListItem> = tabs.iter()
         .map(|&t| ListItem::new(format!("  {t}")).style(dim()))
@@ -599,6 +666,129 @@ fn render_sidebar(f: &mut Frame, app: &TuiApp, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.active_tab));
     f.render_stateful_widget(list, area, &mut state);
+}
+
+// ── Overview tab ──────────────────────────────────────────────────────────────
+
+fn render_overview(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let sys = &app.system;
+    let bat = &app.battery.info;
+
+    // Layout: summary strip on top, then a 2-column grid of charts
+    let rows = Layout::vertical([
+        Constraint::Length(1),   // summary strip
+        Constraint::Fill(1),     // charts
+    ]).split(area);
+
+    // ── Summary strip ────────────────────────────────────────────────────────
+    let mut summary: Vec<Span> = vec![
+        Span::styled("overview", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", fnt()),
+    ];
+    if let Some(ref m) = sys.cpu_model {
+        let s: String = m.chars().take(40).collect();
+        summary.push(Span::styled(s, dim()));
+        summary.push(Span::styled("  ·  ", fnt()));
+    }
+    let ac = if sys.ac_connected { "AC" } else { "BAT" };
+    let ac_col = if sys.ac_connected { GREEN } else { DIM };
+    summary.push(Span::styled(ac, Style::default().fg(ac_col)));
+    f.render_widget(
+        Paragraph::new(Line::from(summary)).style(Style::default().bg(Color::Rgb(11, 11, 11))),
+        rows[0],
+    );
+
+    // ── Chart grid ───────────────────────────────────────────────────────────
+    // 3 rows x 2 columns
+    let chart_rows = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+    ]).split(rows[1]);
+
+    let row0 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[0]);
+    let row1 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[1]);
+    let row2 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[2]);
+
+    // helper: render one chart card with inline title+value and a full-height sparkline
+    let render_chart = |f: &mut Frame, area: Rect, title: &str, current: Option<String>, hist: &History, color: Color, max: u64| {
+        let val_text = current.clone().unwrap_or_else(|| "—".to_string());
+        let title_line = Line::from(vec![
+            Span::styled(format!(" {title} "), fnt()),
+            Span::styled(val_text, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]);
+
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Rgb(35, 35, 35)))
+            .title_top(title_line)
+            .style(Style::default().bg(Color::Rgb(14, 14, 14)));
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner.height < 1 || inner.width < 1 { return; }
+
+        let data = hist.data();
+        if !data.is_empty() {
+            let spark = Sparkline::default()
+                .data(data.as_slice())
+                .max(max)
+                .direction(ratatui::widgets::RenderDirection::RightToLeft)
+                .style(Style::default().fg(color).bg(Color::Rgb(14, 14, 14)));
+            f.render_widget(spark, inner);
+        } else if current.is_none() {
+            f.render_widget(
+                Paragraph::new(Span::styled(" no data", fnt()))
+                    .style(Style::default().bg(Color::Rgb(14, 14, 14))),
+                inner,
+            );
+        }
+    };
+
+    // CPU temp
+    let cpu_cur = sys.cpu_temp_c.map(|t| format!("{:.0}°C", t));
+    let cpu_color = sys.cpu_temp_c
+        .map(|t| if t >= 85.0 { DANGER } else if t >= 70.0 { Color::Rgb(220, 180, 70) } else { GREEN })
+        .unwrap_or(GREEN);
+    let cpu_max = app.hist_cpu_temp.data().iter().copied().max().unwrap_or(100).max(100);
+    render_chart(f, row0[0], "cpu temp", cpu_cur, &app.hist_cpu_temp, cpu_color, cpu_max);
+
+    // GPU temp
+    let gpu_cur = sys.gpu_temp_c.map(|t| format!("{:.0}°C", t));
+    let gpu_color = sys.gpu_temp_c
+        .map(|t| if t >= 88.0 { DANGER } else if t >= 75.0 { Color::Rgb(220, 180, 70) } else { GREEN })
+        .unwrap_or(GREEN);
+    let gpu_max = app.hist_gpu_temp.data().iter().copied().max().unwrap_or(100).max(100);
+    render_chart(f, row0[1], "gpu temp", gpu_cur, &app.hist_gpu_temp, gpu_color, gpu_max);
+
+    // Memory %
+    let mem_cur = sys.mem_used_percent().map(|p| format!("{:.0}%", p));
+    let mem_color = sys.mem_used_percent()
+        .map(|p| if p > 85.0 { DANGER } else if p > 65.0 { Color::Rgb(220, 180, 70) } else { GREEN })
+        .unwrap_or(GREEN);
+    render_chart(f, row1[0], "memory", mem_cur, &app.hist_mem_pct, mem_color, 100);
+
+    // Battery %
+    let bat_val = format!("{}%", bat.capacity);
+    let bat_color = if bat.capacity < 20 && !bat.status.is_plugged() {
+        DANGER
+    } else if bat.status.is_plugged() {
+        Color::Rgb(100, 200, 255)
+    } else {
+        GREEN
+    };
+    render_chart(f, row1[1], "battery", Some(bat_val), &app.hist_bat_pct, bat_color, 100);
+
+    // CPU fan RPM
+    let fan_cpu_cur = app.cpu.fan_cpu_rpm.map(|r| format!("{} rpm", r));
+    let fan_cpu_max = app.hist_fan_cpu.data().iter().copied().max().unwrap_or(5000).max(3000);
+    render_chart(f, row2[0], "cpu fan", fan_cpu_cur, &app.hist_fan_cpu, GREEN, fan_cpu_max);
+
+    // GPU fan RPM
+    let fan_gpu_cur = app.cpu.fan_gpu_rpm.map(|r| format!("{} rpm", r));
+    let fan_gpu_max = app.hist_fan_gpu.data().iter().copied().max().unwrap_or(5000).max(3000);
+    render_chart(f, row2[1], "gpu fan", fan_gpu_cur, &app.hist_fan_gpu, GREEN, fan_gpu_max);
 }
 
 // ── Battery tab ───────────────────────────────────────────────────────────────
@@ -1247,7 +1437,7 @@ fn render_audio(f: &mut Frame, app: &TuiApp, area: Rect) {
     }
 }
 
-fn render_device_list(devices: &[crate::audio::AudioDevice], focused: bool, cursor: usize) -> Vec<Line> {
+fn render_device_list(devices: &[crate::audio::AudioDevice], focused: bool, cursor: usize) -> Vec<Line<'_>> {
     let mut lines: Vec<Line> = vec![];
     let mut row = 0usize;
 
@@ -1508,13 +1698,14 @@ fn render_settings(f: &mut Frame, app: &TuiApp, area: Rect) {
 
 fn render_statusbar(f: &mut Frame, app: &TuiApp, area: Rect) {
     let keys = match (app.active_tab, app.focus) {
-        (0, Focus::Content) => "  q quit   tab→sidebar   ←→ limit   shift+←→ ±5   1/2/3 presets   a/↵ apply   s setup/persist   r refresh",
-        (1, Focus::Content) => "  q quit   tab→sidebar   r refresh",
-        (2, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space toggle   a/↵ apply   r refresh",
-        (3, Focus::Content) => "  q quit   tab→sidebar   ← → select mode   a/↵ apply   r refresh",
-        (4, Focus::Content) => "  q quit   tab output/input   j/k navigate   enter activate port   space mute   d default",
-        (5, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   a/↵ apply",
-        (6, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space/↵ toggle   r refresh",
+        (0, Focus::Content) => "  q quit   tab→sidebar   r refresh",
+        (1, Focus::Content) => "  q quit   tab→sidebar   ←→ limit   shift+←→ ±5   1/2/3 presets   a/↵ apply   s setup/persist   r refresh",
+        (2, Focus::Content) => "  q quit   tab→sidebar   r refresh",
+        (3, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space toggle   a/↵ apply   r refresh",
+        (4, Focus::Content) => "  q quit   tab→sidebar   ← → select mode   a/↵ apply   r refresh",
+        (5, Focus::Content) => "  q quit   tab output/input   j/k navigate   enter activate port   space mute   d default",
+        (6, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   a/↵ apply",
+        (7, Focus::Content) => "  q quit   tab→sidebar   j/k navigate   ←→ adjust   space/↵ toggle   r refresh",
         (_, Focus::Sidebar)  => "  q quit   j/k navigate   ↵/→ select tab   tab→content   r refresh",
         _                    => "  q quit",
     };

@@ -16,6 +16,7 @@ pub struct AudioDevice {
     pub muted: bool,
     pub is_default: bool,
     pub ports: Vec<AudioPort>,
+    #[allow(dead_code)]
     pub active_port: Option<String>,
 }
 

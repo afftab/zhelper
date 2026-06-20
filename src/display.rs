@@ -10,6 +10,7 @@ pub struct DisplayMode {
     pub height: u32,
     pub refresh_rate: f64,
     pub is_current: bool,
+    #[allow(dead_code)]
     pub is_preferred: bool,
 }
 
