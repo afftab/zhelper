@@ -103,6 +103,7 @@ pub struct TuiApp {
     pub hist_bat_pct:     History,
     pub hist_fan_cpu:     History,
     pub hist_fan_gpu:     History,
+    pub hist_power:       History,
     pub needs_redraw:     bool,
 }
 
@@ -134,6 +135,7 @@ impl TuiApp {
             hist_bat_pct: History::default(),
             hist_fan_cpu: History::default(),
             hist_fan_gpu: History::default(),
+            hist_power: History::default(),
             needs_redraw: true,
         };
         if app.config.auto_apply_on_start {
@@ -173,6 +175,9 @@ impl TuiApp {
         }
         if let Some(r) = self.cpu.fan_gpu_rpm {
             self.hist_fan_gpu.push(r as u64);
+        }
+        if let Some(p) = self.battery.info.power_w {
+            self.hist_power.push((p * 10.0).round() as u64);
         }
         self.needs_redraw = true;
     }
@@ -699,8 +704,9 @@ fn render_overview(f: &mut Frame, app: &TuiApp, area: Rect) {
     );
 
     // ── Chart grid ───────────────────────────────────────────────────────────
-    // 3 rows x 2 columns
+    // 4 rows x 2 columns
     let chart_rows = Layout::vertical([
+        Constraint::Fill(1),
         Constraint::Fill(1),
         Constraint::Fill(1),
         Constraint::Fill(1),
@@ -709,6 +715,7 @@ fn render_overview(f: &mut Frame, app: &TuiApp, area: Rect) {
     let row0 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[0]);
     let row1 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[1]);
     let row2 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[2]);
+    let row3 = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(chart_rows[3]);
 
     // helper: render one chart card with inline title+value and a full-height sparkline
     let render_chart = |f: &mut Frame, area: Rect, title: &str, current: Option<String>, hist: &History, color: Color, max: u64| {
@@ -789,6 +796,11 @@ fn render_overview(f: &mut Frame, app: &TuiApp, area: Rect) {
     let fan_gpu_cur = app.cpu.fan_gpu_rpm.map(|r| format!("{} rpm", r));
     let fan_gpu_max = app.hist_fan_gpu.data().iter().copied().max().unwrap_or(5000).max(3000);
     render_chart(f, row2[1], "gpu fan", fan_gpu_cur, &app.hist_fan_gpu, GREEN, fan_gpu_max);
+
+    // Power draw (battery)
+    let power_cur = bat.power_w.map(|p| format!("{:.1} W", p));
+    let power_max = app.hist_power.data().iter().copied().max().unwrap_or(20).max(5);
+    render_chart(f, row3[0], "power draw", power_cur, &app.hist_power, GREEN, power_max);
 }
 
 // ── Battery tab ───────────────────────────────────────────────────────────────
